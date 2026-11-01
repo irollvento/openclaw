@@ -557,6 +557,71 @@ describe("createInboundDebouncer", () => {
     expect({ started, finished }).toStrictEqual({ started: ["2", "3"], finished: ["2", "3"] });
   });
 
+  it("seals a hot key's batch at the item cap instead of buffering unbounded messages", async () => {
+    const { calls, debouncer } = createRecordingDebouncer({
+      debounceMs: 50,
+      maxItemsPerFlush: 2,
+    });
+
+    for (const id of ["1", "2", "3", "4", "5"]) {
+      await debouncer.enqueue({ key: "a", id });
+    }
+    await vi.advanceTimersByTimeAsync(50);
+    await debouncer.drain();
+
+    expect(calls).toEqual([["1", "2"], ["3", "4"], ["5"]]);
+  });
+
+  it("applies the default item cap when no explicit limit is configured", async () => {
+    const { calls, debouncer } = createRecordingDebouncer({ debounceMs: 50 });
+
+    for (let index = 0; index < 102; index += 1) {
+      await debouncer.enqueue({ key: "a", id: `${index}` });
+    }
+    await vi.advanceTimersByTimeAsync(50);
+    await debouncer.drain();
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toHaveLength(100);
+    expect(calls[1]).toHaveLength(2);
+  });
+
+  it("holds new buffered work when sealed batches accumulate behind blocked admission", async () => {
+    const firstGate = createDeferred();
+    const calls: string[][] = [];
+    const debouncer = batchDebouncer<Message>(
+      {
+        debounceMs: 50,
+        buildKey: () => "sender",
+        maxPendingBatchesPerKey: 2,
+        canAppend: () => false,
+      },
+      async (items) => {
+        calls.push(items.map((item) => item.id));
+        if (items[0]?.id === "1") {
+          await firstGate.promise;
+        }
+      },
+    );
+
+    for (const id of ["1", "2", "3"]) {
+      await debouncer.enqueue({ key: "a", id });
+    }
+    const held = debouncer.enqueue({ key: "a", id: "4" });
+    let heldResolved = false;
+    void held.then(() => {
+      heldResolved = true;
+    });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(heldResolved).toBe(false);
+    expect(calls).toEqual([["1"]]);
+
+    firstGate.resolve();
+    await vi.advanceTimersByTimeAsync(100);
+    await Promise.all([held, debouncer.drain()]);
+    expect(calls).toEqual([["1"], ["2"], ["3"], ["4"]]);
+  });
+
   it("counts tracked debounce keys by union of buffers and active chains", async () => {
     const { debouncer, started, finished, entered, release } = createBlockedDebouncer(
       { maxTrackedKeys: 3 },
@@ -580,5 +645,139 @@ describe("createInboundDebouncer", () => {
     debouncer.cancelKey("a");
     debouncer.cancelKey("c");
     await debouncer.drain();
+  });
+
+  it("seals by the stricter of a channel byte cap and the shared item cap", async () => {
+    const byteBudget = 18;
+    const { calls, debouncer } = createRecordingDebouncer({
+      debounceMs: 50,
+      maxItemsPerFlush: 5,
+      canAppend: (item, pending) =>
+        pending.reduce((total, entry) => total + entry.id.length, 0) + item.id.length <= byteBudget,
+    });
+
+    for (const index of [0, 1, 2, 3, 4]) {
+      await debouncer.enqueue({ key: "a", id: `m${String(index).padStart(4, "0")}` });
+    }
+    await vi.advanceTimersByTimeAsync(50);
+    await debouncer.drain();
+
+    // Each id is 6 chars, so the byte budget admits three per batch even though
+    // the shared item cap would admit five.
+    expect(calls).toEqual([
+      ["m0000", "m0001", "m0002"],
+      ["m0003", "m0004"],
+    ]);
+  });
+
+  it("keeps a capacity-waiting item ahead of a later immediate item", async () => {
+    const firstGate = createDeferred();
+    const calls: string[][] = [];
+    const debouncer = batchDebouncer<Message>(
+      {
+        debounceMs: 50,
+        buildKey: () => "sender",
+        maxPendingBatchesPerKey: 1,
+        canAppend: () => false,
+        shouldDebounce: (item) => item.id !== "cmd",
+      },
+      async (items) => {
+        calls.push(items.map((item) => item.id));
+        if (items[0]?.id === "1") {
+          await firstGate.promise;
+        }
+      },
+    );
+
+    await debouncer.enqueue({ key: "a", id: "1" });
+    await debouncer.enqueue({ key: "a", id: "2" });
+    const waiting = debouncer.enqueue({ key: "a", id: "3" });
+    const immediate = debouncer.enqueue({ key: "a", id: "cmd" });
+    await vi.advanceTimersByTimeAsync(50);
+
+    firstGate.resolve();
+    for (let step = 0; step < 8 && calls.length < 4; step += 1) {
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    await Promise.all([waiting, immediate, debouncer.drain()]);
+
+    expect(calls).toEqual([["1"], ["2"], ["3"], ["cmd"]]);
+  });
+
+  it("cancels a capacity-waiting item with the key's other pending work", async () => {
+    const firstGate = createDeferred();
+    const calls: string[][] = [];
+    const cancelledItems: string[] = [];
+    const debouncer = batchDebouncer<Message>(
+      {
+        debounceMs: 50,
+        buildKey: () => "sender",
+        maxPendingBatchesPerKey: 1,
+        canAppend: () => false,
+        onCancel: (items) => {
+          cancelledItems.push(...items.map((item) => item.id));
+        },
+      },
+      async (items) => {
+        calls.push(items.map((item) => item.id));
+        if (items[0]?.id === "1") {
+          await firstGate.promise;
+        }
+      },
+    );
+
+    await debouncer.enqueue({ key: "a", id: "1" });
+    await debouncer.enqueue({ key: "a", id: "2" });
+    const waiting = debouncer.enqueue({ key: "a", id: "3" });
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(debouncer.cancelKey("sender")).toBe(true);
+    firstGate.resolve();
+    for (let step = 0; step < 8; step += 1) {
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    await Promise.all([waiting, debouncer.drain()]);
+
+    expect(cancelledItems).toEqual(["2", "3"]);
+    expect(calls).toEqual([["1"]]);
+  });
+
+  it("admits capacity waiters one freed slot at a time", async () => {
+    const firstGate = createDeferred();
+    const calls: string[][] = [];
+    const debouncer = batchDebouncer<Message>(
+      {
+        debounceMs: 50,
+        buildKey: () => "sender",
+        maxPendingBatchesPerKey: 1,
+        canAppend: () => false,
+      },
+      async (items) => {
+        calls.push(items.map((item) => item.id));
+        if (items[0]?.id === "1") {
+          await firstGate.promise;
+        }
+      },
+    );
+
+    await debouncer.enqueue({ key: "a", id: "1" });
+    await debouncer.enqueue({ key: "a", id: "2" });
+    const waiters = ["3", "4", "5"].map((id) =>
+      debouncer.enqueue({ key: "a", id }).catch(() => undefined),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    firstGate.resolve();
+    // One freed admission slot may materialize exactly one waiting batch; the
+    // next waiter stays suspended until that batch starts dispatching.
+    await vi.advanceTimersByTimeAsync(50);
+    expect(vi.getTimerCount()).toBe(1);
+
+    for (let step = 0; step < 8 && calls.length < 5; step += 1) {
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    await Promise.all([...waiters, debouncer.drain()]);
+
+    expect(calls).toEqual([["1"], ["2"], ["3"], ["4"], ["5"]]);
   });
 });
