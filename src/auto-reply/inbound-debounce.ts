@@ -32,6 +32,18 @@ type DebounceBuffer<T> = {
   task: Promise<void>;
 };
 
+/**
+ * A capacity-waiting arrival. Registration keeps cancelKey the single
+ * cancellation owner while the enqueue is suspended; the admission pump
+ * materializes exactly one waiting batch per freed capacity slot.
+ */
+type WaitingAdmission<T> = {
+  items: T[];
+  cancelled: boolean;
+  materialize: () => void;
+  resolveGate: () => void;
+};
+
 /** A flush releases its debounce lane at admission while completion remains drainable. */
 type InboundDebounceFlush = {
   admission: Promise<void>;
@@ -122,12 +134,18 @@ function createInboundDebounceFlush(params: {
 
 const DEFAULT_MAX_TRACKED_KEYS = 2048;
 const MAX_DEBOUNCE_WINDOW_MULTIPLIER = 5;
+const DEFAULT_MAX_ITEMS_PER_FLUSH = 100;
+const DEFAULT_MAX_PENDING_BATCHES_PER_KEY = 4;
 
 /** Options for creating a keyed inbound debouncer. */
 export type InboundDebounceCreateParams<T> = {
   debounceMs: number;
   maxTrackedKeys?: number;
   maxWaitMs?: number | ((item: T) => number | undefined);
+  /** Seal a collecting batch at this item count instead of buffering without bound. */
+  maxItemsPerFlush?: number;
+  /** Hold new buffered work while a key already has this many batches pending dispatch. */
+  maxPendingBatchesPerKey?: number;
   buildKey: (item: T) => string | null | undefined;
   shouldDebounce?: (item: T) => boolean;
   /** Hold a quiet-period flush before its deadline; explicit flushes bypass this check. */
@@ -145,10 +163,19 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>
   const buffers = new Map<string, DebounceBuffer<T>>();
   const pendingBuffers = new Map<string, Set<DebounceBuffer<T>>>();
   const pendingImmediate = new Map<string, Set<T[]>>();
+  const waitingAdmissions = new Map<string, WaitingAdmission<T>[]>();
   const keyChains = new Map<string, Promise<void>>();
   const activeCompletions = new Set<Promise<void>>();
   const defaultDebounceMs = resolveNonNegativeIntegerOption(params.debounceMs, 0);
   const maxTrackedKeys = Math.max(1, Math.trunc(params.maxTrackedKeys ?? DEFAULT_MAX_TRACKED_KEYS));
+  const maxItemsPerFlush = Math.max(
+    1,
+    Math.trunc(params.maxItemsPerFlush ?? DEFAULT_MAX_ITEMS_PER_FLUSH),
+  );
+  const maxPendingBatchesPerKey = Math.max(
+    1,
+    Math.trunc(params.maxPendingBatchesPerKey ?? DEFAULT_MAX_PENDING_BATCHES_PER_KEY),
+  );
 
   const resolveDebounceMs = (item: T, pending?: readonly T[]) => {
     const resolved = params.resolveDebounceMs?.(item, pending);
@@ -157,7 +184,12 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>
 
   const resolvePending = (item: T, key: string) => {
     const buffer = buffers.get(key);
-    return buffer && (params.canAppend?.(item, buffer.items) ?? true) ? buffer : undefined;
+    if (!buffer || buffer.items.length >= maxItemsPerFlush) {
+      // A full batch seals like a canAppend rejection: the incoming item starts
+      // the next batch instead of growing retained memory without bound.
+      return undefined;
+    }
+    return (params.canAppend?.(item, buffer.items) ?? true) ? buffer : undefined;
   };
   const shouldBuffer = (item: T): boolean => {
     const key = params.buildKey(item);
@@ -285,6 +317,18 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>
         cancelItems(items.splice(0));
       }
     }
+    pendingImmediate.delete(key);
+    const waiting = waitingAdmissions.get(key);
+    if (waiting) {
+      waitingAdmissions.delete(key);
+      for (const admission of waiting.splice(0)) {
+        // A capacity-waiting arrival belongs to the same cancellation owner:
+        // settle it here so a stopped prompt can never dispatch after release.
+        admission.cancelled = true;
+        cancelItems(admission.items);
+        admission.resolveGate();
+      }
+    }
     pendingBuffers.delete(key);
     return true;
   };
@@ -338,6 +382,37 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>
     buffer.timeout.unref?.();
   };
 
+  /** Materialize waiting batches one freed capacity slot at a time, in order. */
+  const pumpWaitingAdmissions = (key: string) => {
+    const queue = waitingAdmissions.get(key);
+    if (!queue?.length) {
+      return;
+    }
+    let available = maxPendingBatchesPerKey - (pendingBuffers.get(key)?.size ?? 0);
+    while (queue.length > 0 && available > 0) {
+      const admission = queue.shift();
+      if (queue.length === 0) {
+        waitingAdmissions.delete(key);
+      }
+      if (!admission || admission.cancelled) {
+        continue;
+      }
+      admission.materialize();
+      available -= 1;
+      admission.resolveGate();
+    }
+  };
+
+  /** Drop a batch from the key's capacity budget and admit one waiting arrival. */
+  const releasePendingBuffer = (key: string, buffer: DebounceBuffer<T>) => {
+    const pending = pendingBuffers.get(key);
+    pending?.delete(buffer);
+    if (pending?.size === 0) {
+      pendingBuffers.delete(key);
+    }
+    pumpWaitingAdmissions(key);
+  };
+
   const enqueue = async (item: T) => {
     const key = params.buildKey(item);
     const existing = key ? resolvePending(item, key) : undefined;
@@ -375,14 +450,70 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>
       await enqueueImmediate(key, item);
       return;
     }
+    const queuedBatches = pendingBuffers.get(key);
+    const waitingQueue = waitingAdmissions.get(key);
+    if ((queuedBatches?.size ?? 0) >= maxPendingBatchesPerKey || (waitingQueue?.length ?? 0) > 0) {
+      // Backpressure, not drops. While a key holds its batch budget (or earlier
+      // arrivals are still waiting), this enqueue reserves its FIFO chain slot
+      // before suspending, so later immediate items cannot overtake it, and it
+      // stays registered so cancelKey remains the single cancellation owner.
+      // The admission pump materializes exactly one waiting batch per freed
+      // capacity slot, so concurrent producers cannot exceed the budget.
+      const { promise: gate, resolve: resolveGate } = createDeferredCore();
+      const admission: WaitingAdmission<T> = {
+        items: [item],
+        cancelled: false,
+        materialize: () => undefined,
+        resolveGate,
+      };
+      const entries = waitingQueue ?? [];
+      entries.push(admission);
+      waitingAdmissions.set(key, entries);
+      const { promise: ready, resolve: releaseReady } = createDeferredCore();
+      let buffer: DebounceBuffer<T> | undefined;
+      const task = enqueueKeyTask(key, async () => {
+        pumpWaitingAdmissions(key);
+        await gate;
+        if (admission.cancelled || !buffer) {
+          return;
+        }
+        await ready;
+        releasePendingBuffer(key, buffer);
+        if (buffer.items.length === 0) {
+          return;
+        }
+        await runFlush(buffer.items);
+      });
+      admission.materialize = () => {
+        buffer = {
+          items: admission.items,
+          timeout: null,
+          debounceMs,
+          flushDeadlineMs:
+            performance.now() +
+            Math.max(
+              debounceMs,
+              resolveNonNegativeIntegerOption(
+                typeof params.maxWaitMs === "function" ? params.maxWaitMs(item) : params.maxWaitMs,
+                debounceMs * MAX_DEBOUNCE_WINDOW_MULTIPLIER,
+              ),
+            ),
+          releaseReady,
+          task,
+        };
+        buffers.set(key, buffer);
+        const pending = pendingBuffers.get(key) ?? new Set<DebounceBuffer<T>>();
+        pending.add(buffer);
+        pendingBuffers.set(key, pending);
+        scheduleFlush(key, buffer);
+      };
+      await gate;
+      return;
+    }
     const { promise: ready, resolve: releaseReady } = createDeferredCore();
     const task = enqueueKeyTask(key, async () => {
       await ready;
-      const pending = pendingBuffers.get(key);
-      pending?.delete(buffer);
-      if (pending?.size === 0) {
-        pendingBuffers.delete(key);
-      }
+      releasePendingBuffer(key, buffer);
       if (buffer.items.length === 0) {
         return;
       }
