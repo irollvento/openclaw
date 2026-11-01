@@ -347,13 +347,13 @@ export function installWarmReloadBrowserProbe(route: string, textFidelity = fals
       const text = answer.textContent ?? "";
       const box = answer.getBoundingClientRect();
       const textHash = hash(text);
-      const previous = data.textStates.at(-1);
+      const previousText = data.textStates.at(-1);
       if (
         box.width > 0 &&
         box.height > 0 &&
-        (previous?.hash !== textHash ||
-          previous.height !== box.height ||
-          previous.width !== box.width)
+        (previousText?.hash !== textHash ||
+          previousText.height !== box.height ||
+          previousText.width !== box.width)
       ) {
         data.textStates.push({
           atMs: performance.now(),

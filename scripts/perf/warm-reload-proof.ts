@@ -562,9 +562,9 @@ async function captureReload(
   } finally {
     if (profiling) {
       const { profile } = await cdp.send("Profiler.stop");
-      const complete = new Promise<void>((resolve) =>
-        cdp.once("Tracing.tracingComplete", () => resolve()),
-      );
+      const complete = new Promise<void>((resolve) => {
+        cdp.once("Tracing.tracingComplete", () => resolve());
+      });
       await cdp.send("Tracing.end");
       await complete;
       cdp.off("Tracing.dataCollected", onTrace);
@@ -823,9 +823,9 @@ try {
           }
           await waitForControlUiGatewayReady(page, 60000);
           const operator = values["text-fidelity"]
-            ? await evaluateControlUiContext(page, (context) => ({
-                gatewayUrl: context.gateway.connection.gatewayUrl.replace(/\/$/u, ""),
-                userId: context.gateway.snapshot.selfUser?.id,
+            ? await evaluateControlUiContext(page, (app) => ({
+                gatewayUrl: app.gateway.connection.gatewayUrl.replace(/\/$/u, ""),
+                userId: app.gateway.snapshot.selfUser?.id,
               }))
             : null;
           await page.waitForFunction(() => navigator.serviceWorker.controller !== null, undefined, {
@@ -859,7 +859,9 @@ try {
           });
           await cdp.send("Network.clearBrowserCache");
           if (operator) {
-            if (!operator.userId) throw new Error("Text fidelity requires an identified operator");
+            if (!operator.userId) {
+              throw new Error("Text fidelity requires an identified operator");
+            }
             await page.evaluate(({ gatewayUrl, userId }) => {
               localStorage.setItem("openclaw:sidebar:sessions:grouping", "category");
               localStorage.setItem("openclaw:sidebar:sessions:sort-mode", "created");
