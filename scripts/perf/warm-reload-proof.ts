@@ -15,6 +15,7 @@ import {
   DEVICE_AUTH_STORAGE_KEY_PREFIX,
 } from "../../src/shared/control-ui-storage.ts";
 import { createControlUiE2eArtifactDir } from "../../ui/src/test-helpers/control-ui-e2e-artifacts.ts";
+import { evaluateControlUiContext } from "../../ui/src/test-helpers/control-ui-e2e-context.ts";
 import { waitForControlUiGatewayReady } from "../../ui/src/test-helpers/control-ui-e2e-readiness.ts";
 import { stopChild } from "../lib/gateway-bench-child.ts";
 import { freeProofPort, startWarmReloadAdmission } from "./warm-reload-admission.ts";
@@ -37,6 +38,8 @@ const { values } = parseArgs({
     sessions: { type: "string", default: "3000" },
     "rtt-ms": { type: "string", default: "80" },
     "capture-ms": { type: "string", default: "8000" },
+    "text-fidelity": { type: "boolean", default: false },
+    "cpu-profile": { type: "boolean", default: false },
     route: { type: "string", default: "both" },
     "audit-report": { type: "string" },
     "paint-audit": { type: "string" },
@@ -58,10 +61,14 @@ if (values["audit-report"] || values["paint-audit"]) {
     throw new Error("--audit-report and --paint-audit must be supplied together");
   }
   const audited = await applyWarmReloadPaintAudit(values["audit-report"], values["paint-audit"]);
-  const report: { results: Parameters<typeof createWarmReloadComparison>[0] } = JSON.parse(
-    await readFile(audited, "utf8"),
-  );
-  if (report.results.some((result) => result.arm === "base" || result.arm === "candidate")) {
+  const report: {
+    results: Parameters<typeof createWarmReloadComparison>[0];
+    profiled?: boolean;
+  } = JSON.parse(await readFile(audited, "utf8"));
+  if (
+    !report.profiled &&
+    report.results.some((result) => result.arm === "base" || result.arm === "candidate")
+  ) {
     await createWarmReloadComparison(report.results, path.dirname(audited));
   }
   console.info("Wrote audited-report.json beside the immutable capture report");
@@ -356,7 +363,19 @@ async function captureReload(
   cdp.on("Network.webSocketFrameSent", onSent);
   cdp.on("Network.webSocketFrameReceived", onReceived);
   page.on("pageerror", onError);
+  const profiling = warm && values["cpu-profile"];
+  const timeline: unknown[] = [];
+  const onTrace = ({ value }: { value: unknown[] }) => timeline.push(...value);
   try {
+    if (profiling) {
+      cdp.on("Tracing.dataCollected", onTrace);
+      await cdp.send("Profiler.enable");
+      await cdp.send("Profiler.start");
+      await cdp.send("Tracing.start", {
+        categories: "toplevel,loading,blink.user_timing,devtools.timeline,v8",
+        transferMode: "ReportEvents",
+      });
+    }
     await cdp.send("Page.startScreencast", {
       format: "png",
       maxWidth: viewport.width,
@@ -541,6 +560,20 @@ async function captureReload(
     );
     return report;
   } finally {
+    if (profiling) {
+      const { profile } = await cdp.send("Profiler.stop");
+      const complete = new Promise<void>((resolve) => {
+        cdp.once("Tracing.tracingComplete", () => resolve());
+      });
+      await cdp.send("Tracing.end");
+      await complete;
+      cdp.off("Tracing.dataCollected", onTrace);
+      await writeFile(path.join(outputDir, "reload.cpuprofile"), JSON.stringify(profile));
+      await writeFile(
+        path.join(outputDir, "trace.json"),
+        JSON.stringify({ traceEvents: timeline }),
+      );
+    }
     await cdp.send("Page.stopScreencast").catch(() => {});
     cdp.off("Page.screencastFrame", onFrame);
     cdp.off("Network.requestWillBeSent", onDocument);
@@ -621,6 +654,7 @@ try {
     port,
     uiRoot: servedUiRoot,
     sessions,
+    textFidelity: values["text-fidelity"],
     ...(admission
       ? {
           admission: {
@@ -759,7 +793,7 @@ try {
           diagnosticPage = page;
           page.setDefaultTimeout(60000);
           await page.addInitScript({
-            content: `globalThis.__name = (fn) => fn; (${installWarmReloadBrowserProbe.toString()})(${JSON.stringify(route)});`,
+            content: `globalThis.__name = (fn) => fn; (${installWarmReloadBrowserProbe.toString()})(${JSON.stringify(route)}, ${values["text-fidelity"]});`,
           });
           const cdp = await context.newCDPSession(page);
           await cdp.send("Page.enable");
@@ -788,6 +822,12 @@ try {
             await page.goto(handoffUrl.href);
           }
           await waitForControlUiGatewayReady(page, 60000);
+          const operator = values["text-fidelity"]
+            ? await evaluateControlUiContext(page, (app) => ({
+                gatewayUrl: app.gateway.connection.gatewayUrl.replace(/\/$/u, ""),
+                userId: app.gateway.snapshot.selfUser?.id,
+              }))
+            : null;
           await page.waitForFunction(() => navigator.serviceWorker.controller !== null, undefined, {
             timeout: 60000,
           });
@@ -818,6 +858,30 @@ try {
             storageTypes: "indexeddb,cache_storage",
           });
           await cdp.send("Network.clearBrowserCache");
+          if (operator) {
+            if (!operator.userId) {
+              throw new Error("Text fidelity requires an identified operator");
+            }
+            await page.evaluate(({ gatewayUrl, userId }) => {
+              localStorage.setItem("openclaw:sidebar:sessions:grouping", "category");
+              localStorage.setItem("openclaw:sidebar:sessions:sort-mode", "created");
+              localStorage.setItem("openclaw:sidebar:sessions:show-preview", "false");
+              localStorage.setItem(
+                "openclaw:sidebar:sessions:collapsed-sections",
+                JSON.stringify(
+                  Array.from({ length: 5 }, (_, index) => `category:Fixture category ${index + 1}`),
+                ),
+              );
+              localStorage.setItem(
+                `openclaw.control.sidebarSessionOwnerFilter.v1:${gatewayUrl}:${encodeURIComponent(userId!)}`,
+                "involving-me",
+              );
+              localStorage.setItem(
+                `openclaw.control.sidebarEmptyGroups.v1:${gatewayUrl}:user:${encodeURIComponent(userId!)}`,
+                "always",
+              );
+            }, operator);
+          }
           const url = `${baseUrl}${routePath}`;
           results.push({
             arm: arm.name,
@@ -921,6 +985,7 @@ try {
   }
   const report = {
     revision,
+    profiled: values["cpu-profile"],
     buildIdentity,
     dist,
     viewport,
@@ -957,7 +1022,7 @@ try {
     results,
   };
   await writeFile(path.join(directory, "report.json"), JSON.stringify(report, null, 2));
-  if (values.base) {
+  if (values.base && !values["cpu-profile"]) {
     await createWarmReloadComparison(results, directory);
   }
   console.info(`Retained proof: ${directory}/report.json`);
